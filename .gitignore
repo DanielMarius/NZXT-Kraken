@@ -2,6 +2,8 @@ bin/
 obj/
 logs/
 runtime/
+.gitea/
+LICENSE.md
 *.log
 health.json
 state.json

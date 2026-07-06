@@ -10,7 +10,7 @@ All notable changes to this project should be recorded in this file.
 - added `docs/ARCHITECTURE.md`
 - added `docs/OPERATIONS.md`
 - added `docs/TROUBLESHOOTING.md`
-- added MIT license in `LICENSE.md`
+- added MIT license files
 - kept standard `LICENSE` file for host/repo license detection
 - cleaned `.gitignore` so runtime artifacts and logs do not get committed
 
