@@ -1,0 +1,40 @@
+name: Feature Request
+description: Propose a new capability or design improvement.
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+      placeholder: Add configurable duty curve per temperature band
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: What limitation or pain point does this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Change
+      description: Describe the desired behavior and any constraints.
+    validations:
+      required: true
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risks Or Hardware Concerns
+      description: Mention any risk to pump, fan, LCD, or controller ownership model.
+  - type: checkboxes
+    id: rules
+    attributes:
+      label: Design Rules
+      options:
+        - label: This proposal does not require adding Python runtime dependencies.
+        - label: This proposal keeps single-process hardware ownership intact.
+        - label: This proposal does not require a second hardware watchdog.

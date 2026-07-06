@@ -1,0 +1,79 @@
+name: Bug Report
+description: Report a controller, LCD, fan, pump, or service problem.
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for real breakage, regressions, service failures, LCD corruption, or hardware control issues.
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+      description: Short description of the problem.
+      placeholder: LCD flickers after service restart
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Controller loop
+        - LCD upload/rendering
+        - Pump/fan control
+        - Supervisor service
+        - Installer/scripts
+        - Documentation
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Hardware, Windows version, Kraken model, GPU, and whether CAM is installed/running.
+      placeholder: |
+        Windows 10
+        Kraken Elite 360
+        NVIDIA GPU
+        CAM installed but not running
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps To Reproduce
+      placeholder: |
+        1. Install service
+        2. Reboot
+        3. Observe LCD after login
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs
+      description: Paste relevant lines from controller.log, supervisor.log, or health.json.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Sanity Checks
+      options:
+        - label: I confirmed CAM is not actively controlling the same Kraken device.
+        - label: I confirmed there is only one KrakenHost controller process.
+        - label: I checked the runtime health and log files before opening this issue.
