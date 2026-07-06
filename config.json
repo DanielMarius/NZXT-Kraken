@@ -1,0 +1,12 @@
+{
+  "interval_seconds": 1.0,
+  "brightness": 100,
+  "rotation_degrees": 90,
+  "text_offset_y_px": -50,
+  "section_gap_px": 10,
+  "cool_threshold_c": 40,
+  "cool_threshold_hysteresis_c": 3,
+  "high_hold_seconds": 10,
+  "low_duty": 80,
+  "high_duty": 100
+}

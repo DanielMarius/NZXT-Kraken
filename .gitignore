@@ -1,0 +1,15 @@
+bin/
+obj/
+logs/
+runtime/
+*.log
+health.json
+state.json
+kraken_lcd.png
+manual_*_stdout.log
+manual_*_stderr.log
+lcd_test*_stdout.log
+lcd_test*_stderr.log
+kraken_native_health.json
+kraken_native_service.log
+kraken_native_watchdog.log
