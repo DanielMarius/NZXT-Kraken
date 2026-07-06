@@ -163,6 +163,8 @@ Additional documentation is under `docs/`:
 - `docs/ARCHITECTURE.md`
 - `docs/OPERATIONS.md`
 - `docs/TROUBLESHOOTING.md`
+- `CHANGELOG.md`
+- `CONTRIBUTING.md`
 
 These files are written so they can also be copied into a Git wiki if needed.
 
@@ -185,3 +187,4 @@ powershell -ExecutionPolicy Bypass -File .\Uninstall-KrakenSupervisorService.ps1
 - Do not add watchdog loops that hammer the LCD.
 - Do not let the supervisor become a second hardware controller.
 - If you change `config.json`, rebuild before reinstalling the service.
+- Follow `CONTRIBUTING.md` for repo workflow and review expectations.
