@@ -1,29 +1,9 @@
 # Architecture
 
-## Process Model
+See the [canonical architecture](https://github.com/DanielMarius/NZXT-Kraken/blob/dev/docs/ARCHITECTURE.md).
 
-There are two intended processes:
-
-- `KrakenHost.exe`
-- `KrakenHost.exe --windows-service`
-
-The controller owns Kraken hardware access.
-
-The supervisor checks controller health every 10 seconds and restarts it if needed.
-
-## Health Model
-
-Health requires:
-
-- controller process exists
-- fresh `health.json`
-- `Status == ok`
-- pump RPM >= `1500`
-- fan RPM >= `1000`
-- LCD status not reporting repeated upload failure
-
-## Default Policy
-
-- below `40C`: fan `80%`, pump `80%`
-- at or above `40C`: fan `100%`, pump `100%`
-- LCD minimum push interval: `2s`
+In v0.2, one controller owns HID/USB and one supervisor reads producer-matched
+health. Missing/invalid temperatures select full cooling. LCD-only failures are
+contained and do not restart otherwise healthy cooling. The supervisor can
+restart an exited controller when ownership is free; it does not kill a live
+unhealthy controller on uncertain evidence.

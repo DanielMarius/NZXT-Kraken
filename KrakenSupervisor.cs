@@ -6,70 +6,75 @@ using System.Threading;
 
 internal sealed class KrakenSupervisor
 {
-    private readonly int _supervisorPid;
     private readonly string _controllerExePath;
     private readonly string _healthPath;
     private readonly string _logPath;
-    private readonly Mutex _mutex;
+    private Process? _controller;
+    private DateTimeOffset _controllerStartedAt;
+    private ControllerHealthSnapshot? _lastGoodHealth;
+    private static readonly TimeSpan HealthTimeout = TimeSpan.FromSeconds(20);
 
     public KrakenSupervisor(string controllerExePath, string healthPath, string logPath)
     {
-        _supervisorPid = Environment.ProcessId;
-        _controllerExePath = controllerExePath;
+        _controllerExePath = Path.GetFullPath(controllerExePath);
         _healthPath = healthPath;
         _logPath = logPath;
-        _mutex = new Mutex(false, @"Global\DrakulaKrakenSupervisor");
     }
 
-    public int Run()
+    public int Run(CancellationToken cancellationToken = default)
     {
-        if (!_mutex.WaitOne(0))
-        {
-            Log("another supervisor instance is already running");
-            return 0;
-        }
-
+        using var mutex = new Mutex(false, @"Global\DrakulaKrakenSupervisor");
+        var acquired = false;
         try
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(_logPath)!);
+            try { acquired = mutex.WaitOne(0); }
+            catch (AbandonedMutexException) { acquired = true; }
+            if (!acquired)
+            {
+                Log("another supervisor instance is already running");
+                return 0;
+            }
+
+            ControllerFiles.TryEnsureDirectory(Path.GetDirectoryName(_logPath)!);
             Log("supervisor started");
-            RunLoop(CancellationToken.None);
+            RunLoop(cancellationToken);
             return 0;
         }
         finally
         {
-            try
-            {
-                _mutex.ReleaseMutex();
-            }
-            catch
-            {
-            }
-
-            _mutex.Dispose();
+            // Disposing a Process handle does not stop the controller.
+            _controller?.Dispose();
+            _controller = null;
+            _controllerStartedAt = default;
+            _lastGoodHealth = null;
+            if (acquired) mutex.ReleaseMutex();
         }
     }
 
-    public void RunLoop(CancellationToken cancellationToken)
+    private void RunLoop(CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
         {
             try
             {
                 var controller = FindControllerProcess();
-                var healthy = controller is not null && IsHealthy(controller);
-
-                if (!healthy)
+                if (controller is null)
                 {
-                    TryMaxCooling();
-
-                    if (controller is not null)
+                    if (ControllerMutexIsAvailable() && !cancellationToken.IsCancellationRequested)
                     {
-                        TryKill(controller);
-                        Log($"controller pid={controller.Id} stopped for recovery");
+                        StartControllerHidden();
                     }
-
-                    StartControllerHidden();
+                    else
+                    {
+                        Log("controller ownership unavailable; preserving the existing hardware owner");
+                    }
+                }
+                else if (!IsHealthy(controller, out var reason))
+                {
+                    var startup = IsWithinStartupGrace(_controllerStartedAt, DateTimeOffset.UtcNow);
+                    Log(startup
+                        ? $"controller pid={controller.Id} startup grace: {reason}"
+                        : $"controller pid={controller.Id} unhealthy; recovery blocked without proven cooling fallback: {reason}");
                 }
             }
             catch (Exception ex)
@@ -81,79 +86,142 @@ internal sealed class KrakenSupervisor
         }
     }
 
-    private bool IsHealthy(Process controller)
+    private bool IsHealthy(Process controller, out string reason)
     {
-        if (!File.Exists(_healthPath))
+        if (!MatchesController(controller, _controllerStartedAt))
         {
-            Log("health check failed: health file missing");
+            reason = "controller executable or start identity could not be verified";
             return false;
         }
 
-        var age = DateTimeOffset.Now - File.GetLastWriteTime(_healthPath);
-        if (age > TimeSpan.FromSeconds(20))
+        var now = DateTimeOffset.UtcNow;
+        if (TryReadHealth(out var payload, out var readError))
         {
-            Log($"health check failed: stale health age={age.TotalSeconds:0.0}s");
-            return false;
+            var result = EvaluateHealth(payload, controller.Id, _controllerStartedAt, now);
+            // A newer explicit failure invalidates an older healthy sample.
+            _lastGoodHealth = result.Healthy ? payload : null;
+            reason = result.Reason;
+            return result.Healthy;
         }
 
-        try
+        // A read failure must not renew the original sample's freshness deadline.
+        var cached = EvaluateHealth(_lastGoodHealth, controller.Id, _controllerStartedAt, now);
+        reason = cached.Healthy ? "transient health read failure; last valid sample is still fresh" : readError;
+        return cached.Healthy;
+    }
+
+    internal static bool IsWithinStartupGrace(DateTimeOffset processStartedAt, DateTimeOffset now)
+    {
+        var age = now - processStartedAt;
+        return processStartedAt != default && age >= TimeSpan.Zero && age < HealthTimeout;
+    }
+
+    internal static (bool Healthy, string Reason) EvaluateHealth(
+        ControllerHealthSnapshot? payload, int expectedProcessId,
+        DateTimeOffset expectedProcessStartedAt, DateTimeOffset now)
+    {
+        if (payload is null) return (false, "health payload missing");
+        if (expectedProcessId <= 0 || payload.ProcessId != expectedProcessId ||
+            expectedProcessStartedAt == default || payload.ProcessStartedAt != expectedProcessStartedAt)
+            return (false, "health belongs to a different or unverified controller");
+        if (payload.Timestamp < expectedProcessStartedAt || payload.Timestamp > now.AddSeconds(5))
+            return (false, "health timestamp is invalid");
+        if (now - payload.Timestamp > HealthTimeout)
+            return (false, "health payload is stale");
+        if (!string.Equals(payload.Status, "ok", StringComparison.OrdinalIgnoreCase))
+            return (false, $"health status={payload.Status}");
+        if (!payload.PumpRpm.HasValue || payload.PumpRpm.Value < 1500)
+            return (false, $"pump_rpm={payload.PumpRpm}");
+        if (!payload.FanRpm.HasValue || payload.FanRpm.Value < 1000)
+            return (false, $"fan_rpm={payload.FanRpm}");
+        // LCD failure is not evidence that a healthy cooling controller should be stopped.
+        return (true, "ok");
+    }
+
+    private bool TryReadHealth(out ControllerHealthSnapshot? payload, out string error)
+    {
+        payload = null;
+        error = "health file unreadable";
+        for (var attempt = 0; attempt < 3; attempt++)
         {
-            var payload = JsonSerializer.Deserialize<ControllerHealthSnapshot>(File.ReadAllText(_healthPath, Encoding.UTF8));
-            if (payload is null)
+            try
             {
-                Log("health check failed: empty payload");
-                return false;
+                // Allow atomic replacement while this handle reads a complete old snapshot.
+                using var stream = new FileStream(_healthPath, FileMode.Open, FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete);
+                using var reader = new StreamReader(stream, Encoding.UTF8);
+                payload = JsonSerializer.Deserialize<ControllerHealthSnapshot>(reader.ReadToEnd());
+                if (payload is not null) return true;
+                error = "health payload is empty";
             }
-
-            if (!string.Equals(payload.Status, "ok", StringComparison.OrdinalIgnoreCase))
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
             {
-                Log($"health check failed: status={payload.Status}");
-                return false;
+                error = "health read failed: " + ex.GetType().Name;
             }
-
-            if (!payload.PumpRpm.HasValue || payload.PumpRpm.Value < 1500)
-            {
-                Log($"health check failed: pump_rpm={payload.PumpRpm}");
-                return false;
-            }
-
-            if (!payload.FanRpm.HasValue || payload.FanRpm.Value < 1000)
-            {
-                Log($"health check failed: fan_rpm={payload.FanRpm}");
-                return false;
-            }
-
-            if (string.Equals(payload.LcdStatus, "failed", StringComparison.OrdinalIgnoreCase) ||
-                payload.LcdStatus.Contains("acknowledge", StringComparison.OrdinalIgnoreCase))
-            {
-                Log($"health check failed: lcd_status={payload.LcdStatus}");
-                return false;
-            }
-
-            if (controller.HasExited)
-            {
-                Log("health check failed: controller exited");
-                return false;
-            }
-
-            return true;
+            if (attempt < 2) Thread.Sleep(25);
         }
-        catch
-        {
-            Log("health check failed: payload parse error");
-            return false;
-        }
+        return false;
     }
 
     private Process? FindControllerProcess()
     {
-        return Process.GetProcessesByName("KrakenHost")
-            .FirstOrDefault(process => process.Id != _supervisorPid);
+        if (_controller is not null)
+        {
+            try
+            {
+                _controller.Refresh();
+                if (!_controller.HasExited) return _controller;
+            }
+            catch (Exception ex)
+            {
+                Log("controller liveness could not be verified; preserving it: " + ex.GetType().Name);
+                return _controller;
+            }
+            _controller.Dispose();
+            _controller = null;
+            _controllerStartedAt = default;
+            _lastGoodHealth = null;
+        }
+
+        // Adopt only the exact producer identified by new-format health; legacy PID=0
+        // is left alone and the global controller mutex prevents a second USB owner.
+        if (!TryReadHealth(out var payload, out _) || payload is null || payload.ProcessId <= 0)
+            return null;
+        Process? candidate = null;
+        try
+        {
+            candidate = Process.GetProcessById(payload.ProcessId);
+            if (!MatchesController(candidate, payload.ProcessStartedAt)) return null;
+            _controller = candidate;
+            _controllerStartedAt = payload.ProcessStartedAt;
+            candidate = null;
+            Log($"adopted verified controller pid={_controller.Id}");
+            return _controller;
+        }
+        catch (Exception ex)
+        {
+            Log("health producer unavailable: " + ex.GetType().Name);
+            return null;
+        }
+        finally { candidate?.Dispose(); }
+    }
+
+    private bool MatchesController(Process process, DateTimeOffset expectedStartedAt)
+    {
+        try
+        {
+            return process.Id != Environment.ProcessId && !process.HasExited &&
+                expectedStartedAt != default &&
+                new DateTimeOffset(process.StartTime.ToUniversalTime()) == expectedStartedAt &&
+                string.Equals(Path.GetFullPath(process.MainModule!.FileName), _controllerExePath,
+                    StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
     }
 
     private void StartControllerHidden()
     {
-        var process = Process.Start(new ProcessStartInfo
+        _controller = Process.Start(new ProcessStartInfo
         {
             FileName = _controllerExePath,
             Arguments = "--interval=2 --min-lcd-push=2 --max-lcd-refresh=30",
@@ -163,50 +231,34 @@ internal sealed class KrakenSupervisor
             WindowStyle = ProcessWindowStyle.Hidden
         });
 
-        Log($"controller started pid={process?.Id}");
+        if (_controller is null) throw new InvalidOperationException("Controller process did not start.");
+        _controllerStartedAt = new DateTimeOffset(_controller.StartTime.ToUniversalTime());
+        _lastGoodHealth = null;
+        Log($"controller started pid={_controller.Id}");
     }
 
-    private void TryMaxCooling()
+    private bool ControllerMutexIsAvailable()
     {
         try
         {
-            using var process = Process.Start(new ProcessStartInfo
+            using var mutex = new Mutex(false, @"Global\DrakulaKrakenController");
+            var acquired = false;
+            try
             {
-                FileName = _controllerExePath,
-                Arguments = "--max-cooling",
-                WorkingDirectory = Path.GetDirectoryName(_controllerExePath)!,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true,
-                WindowStyle = ProcessWindowStyle.Hidden
-            });
-
-            process?.WaitForExit(5000);
-            Log("emergency max-cooling invoked");
+                try { acquired = mutex.WaitOne(0); }
+                catch (AbandonedMutexException) { acquired = true; }
+                return acquired;
+            }
+            finally { if (acquired) mutex.ReleaseMutex(); }
         }
         catch (Exception ex)
         {
-            Log("max-cooling failed " + ex.Message);
+            Log("controller mutex could not be verified: " + ex.GetType().Name);
+            return false;
         }
     }
 
-    private static void TryKill(Process process)
-    {
-        try
-        {
-            process.Kill(entireProcessTree: true);
-            process.WaitForExit(5000);
-        }
-        catch
-        {
-        }
-    }
-    private void Log(string message)
-    {
-        var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {message}";
-        File.AppendAllText(_logPath, line + Environment.NewLine, Encoding.UTF8);
-    }
+    private void Log(string message) => ControllerLog.Write(_logPath, message);
 }
 
 internal sealed class KrakenSupervisorWindowsService : ServiceBase
@@ -227,7 +279,7 @@ internal sealed class KrakenSupervisorWindowsService : ServiceBase
     protected override void OnStart(string[] args)
     {
         _cts = new CancellationTokenSource();
-        _thread = new Thread(() => _supervisor.RunLoop(_cts.Token))
+        _thread = new Thread(() => _supervisor.Run(_cts.Token))
         {
             IsBackground = true,
             Name = "KrakenSupervisorLoop"

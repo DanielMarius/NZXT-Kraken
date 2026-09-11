@@ -1,38 +1,12 @@
 # Troubleshooting
 
-## LCD Problems
+Follow the [canonical troubleshooting guide](https://github.com/DanielMarius/NZXT-Kraken/blob/dev/docs/TROUBLESHOOTING.md)
+and [read-only operating checks](https://github.com/DanielMarius/NZXT-Kraken/blob/dev/docs/OPERATIONS.md).
 
-Check:
+An LCD-only fault does not justify interrupting healthy cooling. A genuine
+fan/pump fault needs urgent operator attention, with fresh producer-matched
+telemetry and verified fallback before any authorized handoff. Do not start a
+competing controller, blindly stop CAM, or bypass fresh-install guards.
 
-- CAM is not running
-- only one controller process exists
-- `controller.log` has no repeated LCD upload failures
-
-Recovery:
-
-```powershell
-.\bin\Release\net7.0-windows\KrakenHost.exe --reset-lcd
-.\Stop-KrakenCustomProcesses.ps1
-```
-
-## Fan Or Pump Problems
-
-Check:
-
-```powershell
-Get-Content .\bin\Release\net7.0-windows\runtime\health.json
-```
-
-Use this immediately if needed:
-
-```powershell
-.\bin\Release\net7.0-windows\KrakenHost.exe --max-cooling
-```
-
-## Service Problems
-
-If install or restart fails:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\Install-KrakenSupervisorService.ps1
-```
+Preserve logs and old releases; run diagnostic tooling hidden/background. Include
+the actual release path and health evidence when reporting a problem.

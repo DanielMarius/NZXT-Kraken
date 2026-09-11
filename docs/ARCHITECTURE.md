@@ -14,13 +14,16 @@ The supervisor does not run the main control loop. It only:
 - checks whether a controller exists
 - reads the health snapshot
 - evaluates health rules
-- invokes emergency max cooling on failure
-- restarts the controller if needed
+- tracks exact controller PID, start identity and executable
+- retries transient health-read failures without refreshing their age
+- restarts an exited controller only when the controller mutex is free
+- reports live unhealthy cooling for operator attention; it does not kill it without proven fallback
 
 ## Control Loop
 
 The controller loop:
 
+- establishes 100% fixed cooling before optional telemetry/LCD initialization
 - reads CPU temperature from LibreHardwareMonitor
 - reads GPU temperature through NVML
 - reads liquid temperature plus current RPM from the Kraken
@@ -38,7 +41,12 @@ Health is determined from live controller output:
 - `Status == ok`
 - pump RPM >= `1500`
 - fan RPM >= `1000`
-- LCD status not reporting repeated upload failure
+- payload producer PID/start time matches the controller
+- LCD-only failure does not make cooling unhealthy
+
+Missing or invalid temperatures select 100% duty. Invalid/missing configuration
+also selects full cooling. LCD errors use bounded retries/backoff and do not
+take down otherwise working cooling. Only the controller accesses HID/WinUSB.
 
 This avoids fake liveness from stale PID files.
 

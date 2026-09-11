@@ -1,17 +1,21 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net7.0-windows</TargetFramework>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Version>0.2.0</Version>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
     <AssemblyName>KrakenHost</AssemblyName>
     <RootNamespace>KrakenHost</RootNamespace>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- The separate RGB tool and its generated files are not this controller. -->
+    <Compile Include="*.cs" />
     <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.4" />
-    <PackageReference Include="System.ServiceProcess.ServiceController" Version="7.0.0" />
+    <PackageReference Include="System.ServiceProcess.ServiceController" Version="10.0.12" />
   </ItemGroup>
 
   <ItemGroup>

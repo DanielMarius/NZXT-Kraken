@@ -8,6 +8,13 @@ using System.Text.Json;
 using System.Threading;
 using LibreHardwareMonitor.Hardware;
 
+// Hardware-free checks must run before directories, mutexes, telemetry or USB.
+if (args.Contains("--self-test", StringComparer.OrdinalIgnoreCase))
+{
+    Environment.ExitCode = SafetyChecks.Run();
+    return;
+}
+
 var options = AppOptions.Parse(args);
 var appRoot = AppContext.BaseDirectory;
 var runtimeRoot = Path.Combine(appRoot, "runtime");
@@ -19,8 +26,9 @@ var healthPath = Path.Combine(runtimeRoot, "health.json");
 var controllerLogPath = Path.Combine(logsRoot, "controller.log");
 var supervisorLogPath = Path.Combine(logsRoot, "supervisor.log");
 
-Directory.CreateDirectory(runtimeRoot);
-Directory.CreateDirectory(logsRoot);
+// Unavailable diagnostic storage must not prevent hardware cooling startup.
+ControllerFiles.TryEnsureDirectory(runtimeRoot);
+ControllerFiles.TryEnsureDirectory(logsRoot);
 
 if (options.SupervisorMode)
 {
@@ -42,14 +50,29 @@ if (options.WindowsServiceMode)
 }
 
 using var controllerMutex = new Mutex(false, @"Global\DrakulaKrakenController");
-if (!controllerMutex.WaitOne(0))
+bool ownsController;
+try { ownsController = controllerMutex.WaitOne(0); }
+catch (AbandonedMutexException) { ownsController = true; }
+if (!ownsController)
 {
     throw new InvalidOperationException("Another Kraken controller instance is already running.");
 }
 
-using var cpuReader = new CpuTelemetryReader();
-using var gpuReader = new NvmlGpuTelemetryReader();
-using var krakenDevice = options.CpuGpuOnly ? null : new KrakenNativeDevice();
+if (args.Contains("--verify-cooling-hold", StringComparer.OrdinalIgnoreCase))
+{
+    if (options.CpuGpuOnly || options.RenderOnly || options.MaxCoolingMode || options.ResetLcdMode || options.Once)
+        throw new ArgumentException("Cooling-hold verification must continue into the normal controller.");
+    // Retain the controller mutex throughout proof and normal startup. Closing
+    // a HID handle does not reset the device or relinquish controller ownership.
+    CoolingHoldVerification.Run(Path.Combine(runtimeRoot, "cooling-hold-proof.json"));
+}
+
+using var krakenDevice = options.CpuGpuOnly || options.RenderOnly ? null : new KrakenNativeDevice();
+
+// Establish conservative cooling before optional CPU/GPU libraries or LCD work.
+// The existing running controller is never touched by a second process: the
+// exclusive mutex above is also required for emergency commands.
+krakenDevice?.ApplyFixedDuties(100, 100);
 
 if (options.MaxCoolingMode)
 {
@@ -58,9 +81,10 @@ if (options.MaxCoolingMode)
         throw new InvalidOperationException("Kraken device is required in max cooling mode.");
     }
 
-    krakenDevice.ApplyFixedDuties(100, 100);
     Thread.Sleep(500);
     var status = krakenDevice.ReadStatus();
+    if (status.PumpDuty != 100 || status.FanDuty != 100 || status.PumpRpm < 1500 || status.FanRpm < 1000)
+        throw new InvalidOperationException("Maximum cooling readback was not confirmed.");
     Console.WriteLine($"pump={status.PumpRpm}rpm fan={status.FanRpm}rpm liquid={status.LiquidTempC:0.0}C");
     return;
 }
@@ -77,6 +101,11 @@ if (options.ResetLcdMode)
     return;
 }
 
+using var cpuReader = new CpuTelemetryReader();
+using var gpuReader = new NvmlGpuTelemetryReader();
+using var controllerProcess = System.Diagnostics.Process.GetCurrentProcess();
+var processStartedAt = new DateTimeOffset(controllerProcess.StartTime.ToUniversalTime());
+
 WriteBanner(options);
 ControllerLog.Write(controllerLogPath, "controller started");
 
@@ -86,27 +115,20 @@ DateTimeOffset? lastHighDutyAt = null;
 DateTimeOffset? lcdReadyAt = null;
 DateTimeOffset? lastLcdFailureAt = null;
 var lcdInitialized = false;
+var lastTelemetryLogAt = DateTimeOffset.MinValue;
+string? lastLoggedControlState = null;
 
 do
 {
     var config = ControllerConfig.Load(configPath);
-    if (krakenDevice is not null && !lcdInitialized)
-    {
-        krakenDevice.Initialize(config.Brightness, config.RotationDegrees);
-        lcdInitialized = true;
-        lcdReadyAt = DateTimeOffset.Now.AddSeconds(3);
-    }
-
     var krakenStatus = krakenDevice?.ReadStatus();
     var snapshot = new TelemetrySnapshot(
         DateTimeOffset.Now,
-        cpuReader.TryReadCpuPackageTempC(),
-        gpuReader.TryReadGpuTempC(),
-        krakenStatus?.LiquidTempC,
+        ControllerConfig.NormalizeTemperature(cpuReader.TryReadCpuPackageTempC()),
+        ControllerConfig.NormalizeTemperature(gpuReader.TryReadGpuTempC()),
+        ControllerConfig.NormalizeTemperature(krakenStatus?.LiquidTempC),
         krakenStatus?.PumpRpm,
         krakenStatus?.FanRpm);
-
-    StateWriter.Write(statePath, snapshot);
 
     string lcdStatus;
     if (options.RenderOnly)
@@ -116,11 +138,6 @@ do
     }
     else
     {
-        if (krakenDevice is not null && ConfigAffectsLcd(lastConfig, config))
-        {
-            krakenDevice.ConfigureLcd(config.Brightness, config.RotationDegrees);
-        }
-
         var now = DateTimeOffset.Now;
         int? duty = krakenDevice is null ? null : ControllerConfig.ComputeDuty(snapshot, config, lastDuty, lastHighDutyAt, now);
         if (krakenDevice is not null && duty.HasValue && duty != lastDuty)
@@ -131,36 +148,60 @@ do
             Thread.Sleep(250);
         }
 
-        if (options.NoLcd)
+        try
         {
-            lcdStatus = "disabled";
+            if (options.NoLcd)
+            {
+                lcdStatus = "disabled";
+            }
+            else if (lastLcdFailureAt.HasValue && now - lastLcdFailureAt.Value < TimeSpan.FromSeconds(10))
+            {
+                lcdStatus = "failure_backoff";
+            }
+            else if (krakenDevice is not null && !lcdInitialized)
+            {
+                krakenDevice.Initialize(config.Brightness, config.RotationDegrees);
+                lcdInitialized = true;
+                lastConfig = config;
+                lcdReadyAt = now.AddSeconds(3);
+                lcdStatus = "startup_wait";
+            }
+            else if (lcdReadyAt.HasValue && now < lcdReadyAt.Value)
+            {
+                lcdStatus = "startup_wait";
+            }
+            else
+            {
+                if (krakenDevice is not null && ConfigAffectsLcd(lastConfig, config))
+                {
+                    krakenDevice.ConfigureLcd(config.Brightness, config.RotationDegrees);
+                    lastConfig = config;
+                }
+                var lcdResult = KrakenLcdRenderer.TryPush(
+                    krakenDevice,
+                    snapshot,
+                    imagePath,
+                    options.MinLcdPushInterval,
+                    options.MaxLcdRefreshInterval,
+                    config.TextOffsetYPx,
+                    config.SectionGapPx);
+                lcdStatus = lcdResult.Status;
+                lastLcdFailureAt = lcdResult.Success ? null : now;
+                if (!lcdResult.Success)
+                    ControllerLog.Write(controllerLogPath, "LCD degraded: " + lcdResult.Status);
+            }
         }
-        else if (lcdReadyAt.HasValue && now < lcdReadyAt.Value)
+        catch (Exception ex)
         {
-            lcdStatus = "startup_wait";
-        }
-        else if (lastLcdFailureAt.HasValue && now - lastLcdFailureAt.Value < TimeSpan.FromSeconds(10))
-        {
-            lcdStatus = "failure_backoff";
-        }
-        else
-        {
-            var lcdResult = KrakenLcdRenderer.TryPush(
-                krakenDevice,
-                snapshot,
-                imagePath,
-                options.MinLcdPushInterval,
-                options.MaxLcdRefreshInterval,
-                config.TextOffsetYPx,
-                config.SectionGapPx);
-            lcdStatus = lcdResult.Status;
-            lastLcdFailureAt = lcdResult.Success ? null : now;
+            lcdStatus = "failed";
+            lastLcdFailureAt = now;
+            ControllerLog.Write(controllerLogPath, "LCD degraded: " + ex.Message);
         }
     }
 
-    lastConfig = config;
+    StateWriter.Write(statePath, snapshot);
     ControllerHealth.Write(healthPath, new ControllerHealthSnapshot(
-        Timestamp: DateTimeOffset.Now,
+        Timestamp: snapshot.Timestamp,
         Status: "ok",
         CpuTempC: snapshot.CpuTempC,
         GpuTempC: snapshot.GpuTempC,
@@ -169,8 +210,18 @@ do
         FanRpm: snapshot.FanRpm,
         Duty: lastDuty,
         LcdStatus: lcdStatus,
-        Error: ""));
-    ControllerLog.Write(controllerLogPath, snapshot.ToConsoleLine() + $" DUTY={(lastDuty?.ToString(CultureInfo.InvariantCulture) ?? "N/A")}% LCD={lcdStatus}");
+        Error: "",
+        ProcessId: Environment.ProcessId,
+        ProcessStartedAt: processStartedAt,
+        PumpDuty: krakenStatus?.PumpDuty,
+        FanDuty: krakenStatus?.FanDuty));
+    var controlState = $"DUTY={lastDuty} LCD={(lastLcdFailureAt.HasValue ? "degraded" : "ok")}";
+    if (controlState != lastLoggedControlState || DateTimeOffset.Now - lastTelemetryLogAt >= TimeSpan.FromSeconds(30))
+    {
+        ControllerLog.Write(controllerLogPath, snapshot.ToConsoleLine() + " " + controlState);
+        lastLoggedControlState = controlState;
+        lastTelemetryLogAt = DateTimeOffset.Now;
+    }
     Console.WriteLine(snapshot.ToConsoleLine() + $" DUTY={(lastDuty?.ToString(CultureInfo.InvariantCulture) ?? "N/A")}% LCD={lcdStatus}");
 
     if (options.Once)
@@ -336,14 +387,14 @@ internal static class StateWriter
 {
     public static void Write(string path, TelemetrySnapshot snapshot)
     {
-        var payload = JsonSerializer.Serialize(snapshot, new JsonSerializerOptions { WriteIndented = true });
-        File.WriteAllText(path, payload, Encoding.UTF8);
+        ControllerFiles.TryWriteJson(path, snapshot);
     }
 }
 
 internal sealed class CpuTelemetryReader : IDisposable
 {
     private readonly Computer _computer;
+    private readonly bool _available;
 
     public CpuTelemetryReader()
     {
@@ -351,11 +402,22 @@ internal sealed class CpuTelemetryReader : IDisposable
         {
             IsCpuEnabled = true
         };
-        _computer.Open();
+        try
+        {
+            _computer.Open();
+            _available = true;
+        }
+        catch
+        {
+            // Missing optional telemetry selects full duty; it must not abort
+            // the cooling controller that already established safe startup duty.
+            try { _computer.Close(); } catch { }
+        }
     }
 
     public float? TryReadCpuPackageTempC()
     {
+        if (!_available) return null;
         try
         {
             foreach (var hardware in _computer.Hardware)
@@ -385,7 +447,7 @@ internal sealed class CpuTelemetryReader : IDisposable
 
     public void Dispose()
     {
-        _computer.Close();
+        try { _computer.Close(); } catch { }
     }
 
     private static IEnumerable<IHardware> Flatten(IHardware hardware)
@@ -652,7 +714,7 @@ internal sealed record ControllerConfig(
             var json = File.ReadAllText(configPath, Encoding.UTF8);
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
-            return new ControllerConfig(
+            var config = new ControllerConfig(
                 root.TryGetProperty("interval_seconds", out var intervalSeconds) ? intervalSeconds.GetDouble() : 2.0,
                 root.TryGetProperty("low_duty", out var lowDuty) ? lowDuty.GetInt32() : 80,
                 root.TryGetProperty("high_duty", out var highDuty) ? highDuty.GetInt32() : 100,
@@ -663,15 +725,31 @@ internal sealed record ControllerConfig(
                 root.TryGetProperty("rotation_degrees", out var rotationDegrees) ? rotationDegrees.GetInt32() : 90,
                 root.TryGetProperty("text_offset_y_px", out var textOffsetY) ? textOffsetY.GetInt32() : -50,
                 root.TryGetProperty("section_gap_px", out var sectionGap) ? sectionGap.GetInt32() : 20);
+            if (!IsValid(config))
+                throw new FormatException("Cooling configuration is outside safe operating bounds.");
+            return config;
         }
         catch
         {
-            return new ControllerConfig(2.0, 80, 100, 40f, 3f, 10, 100, 90, -50, 20);
+            // Invalid/missing configuration must not reduce cooling.
+            return new ControllerConfig(2.0, 100, 100, 40f, 3f, 10, 100, 90, -50, 20);
         }
     }
 
+    internal static bool IsValid(ControllerConfig config) =>
+        double.IsFinite(config.IntervalSeconds) && config.IntervalSeconds is >= 1 and <= 5 &&
+        config.LowDuty is >= 20 and <= 100 && config.HighDuty >= config.LowDuty && config.HighDuty <= 100 &&
+        float.IsFinite(config.CoolThresholdC) && config.CoolThresholdC is >= 25 and <= 90 &&
+        float.IsFinite(config.CoolThresholdHysteresisC) && config.CoolThresholdHysteresisC is >= 0 and <= 20 &&
+        config.HighHoldSeconds is >= 0 and <= 300;
+
     public static int ComputeDuty(TelemetrySnapshot snapshot, ControllerConfig config, int? lastDuty, DateTimeOffset? lastHighDutyAt, DateTimeOffset now)
     {
+        // Missing/invalid telemetry is not evidence that the machine is cool.
+        if (!ValidTemperature(snapshot.CpuTempC) || !ValidTemperature(snapshot.GpuTempC) ||
+            !ValidTemperature(snapshot.LiquidTempC))
+            return 100;
+
         var maxTemp = new[]
         {
             snapshot.CpuTempC,
@@ -697,6 +775,9 @@ internal sealed record ControllerConfig(
 
         return maxTemp >= config.CoolThresholdC ? config.HighDuty : config.LowDuty;
     }
+
+    internal static bool ValidTemperature(float? value) => value.HasValue && float.IsFinite(value.Value) && value > 0 && value < 120;
+    internal static float? NormalizeTemperature(float? value) => ValidTemperature(value) ? value : null;
 }
 
 internal sealed record ControllerHealthSnapshot(
@@ -709,23 +790,17 @@ internal sealed record ControllerHealthSnapshot(
     int? FanRpm,
     int? Duty,
     string LcdStatus,
-    string Error);
+    string Error,
+    int ProcessId = 0,
+    DateTimeOffset ProcessStartedAt = default,
+    int? PumpDuty = null,
+    int? FanDuty = null);
 
 internal static class ControllerHealth
 {
     public static void Write(string path, ControllerHealthSnapshot snapshot)
     {
-        var payload = JsonSerializer.Serialize(snapshot, new JsonSerializerOptions { WriteIndented = true });
-        File.WriteAllText(path, payload, Encoding.UTF8);
-    }
-}
-
-internal static class ControllerLog
-{
-    public static void Write(string path, string message)
-    {
-        var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {message}";
-        File.AppendAllText(path, line + Environment.NewLine, Encoding.UTF8);
+        ControllerFiles.TryWriteJson(path, snapshot);
     }
 }
 

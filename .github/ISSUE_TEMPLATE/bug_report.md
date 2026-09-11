@@ -22,6 +22,9 @@ Short description of the problem.
 ## Environment
 
 - Windows version:
+- Kraken release/version and commit:
+- Actual installed release directory (from `KrakenSupervisor.PathName`):
+- Runtime version / self-contained release:
 - Kraken model:
 - GPU:
 - Is NZXT CAM installed:
@@ -43,11 +46,18 @@ What actually happened?
 
 ## Logs / Health Data
 
-Paste relevant lines from:
+Use the read-only path-resolution recipe in `docs/OPERATIONS.md` through the
+hidden/background launcher. Do not substitute a build output folder for the
+actual installed release. Redact personal paths or secrets before posting.
 
-- `bin\Release\net7.0-windows\runtime\health.json`
-- `bin\Release\net7.0-windows\logs\controller.log`
-- `bin\Release\net7.0-windows\logs\supervisor.log`
+Paste relevant lines from the actual release directory:
+
+- `runtime\health.json`, including timestamp and producer PID/start identity
+- `logs\controller.log`
+- `logs\supervisor.log`
+
+For cooling faults, include observed pump/fan RPM, duty and temperatures. Do not
+stop cooling or launch a competing controller to reproduce a fault.
 
 ## Sanity Checks
 

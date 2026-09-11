@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Globalization;
@@ -26,7 +27,6 @@ internal sealed class KrakenNativeDevice : IDisposable
     private readonly HidDevice _hidDevice;
     private readonly HidStream _hidStream;
     private WinUsbBulkPipe? _bulkPipe;
-    private readonly string _bulkDevicePath;
     private readonly int _hidWriteLength;
     private readonly int _hidReadLength;
     private readonly int _hidWriteOffset;
@@ -51,15 +51,19 @@ internal sealed class KrakenNativeDevice : IDisposable
             throw new InvalidOperationException("NZXT Kraken Elite HID interface could not be opened.");
         }
 
-        _hidStream.ReadTimeout = 2000;
-        _hidStream.WriteTimeout = 5000;
-
-        _hidWriteLength = Math.Max(_hidDevice.GetMaxOutputReportLength(), OutputReportPayloadLength);
-        _hidReadLength = Math.Max(_hidDevice.GetMaxInputReportLength(), InputReportLength);
-        _hidWriteOffset = _hidWriteLength > OutputReportPayloadLength ? 1 : 0;
-
-        _bulkDevicePath = FindBulkInterfacePath(ProductIdKrakenElite)
-            ?? throw new InvalidOperationException("NZXT Kraken Elite WinUSB interface was not found.");
+        try
+        {
+            _hidStream.ReadTimeout = 2000;
+            _hidStream.WriteTimeout = 5000;
+            _hidWriteLength = Math.Max(_hidDevice.GetMaxOutputReportLength(), OutputReportPayloadLength);
+            _hidReadLength = Math.Max(_hidDevice.GetMaxInputReportLength(), InputReportLength);
+            _hidWriteOffset = _hidWriteLength > OutputReportPayloadLength ? 1 : 0;
+        }
+        catch
+        {
+            _hidStream.Dispose();
+            throw;
+        }
     }
 
     public void Initialize(int brightness, int rotationDegrees)
@@ -86,7 +90,15 @@ internal sealed class KrakenNativeDevice : IDisposable
     {
         DrainReports();
         WriteCommand(0x74, 0x01);
-        var msg = ReadUntilPrefix(0x75, 0x01, 50);
+        return ParseStatusReport(ReadUntilPrefix(0x75, 0x01, 50));
+    }
+
+    internal static KrakenDeviceStatus ParseStatusReport(byte[] msg)
+    {
+        if (msg.Length < 26 || msg[0] != 0x75 || msg[1] != 0x01)
+        {
+            throw new InvalidDataException($"Invalid Kraken status report ({msg.Length} bytes).");
+        }
 
         return new KrakenDeviceStatus(
             LiquidTempC: msg[15] + msg[16] / 10f,
@@ -98,8 +110,8 @@ internal sealed class KrakenNativeDevice : IDisposable
 
     public void ApplyFixedDuties(int pumpDuty, int fanDuty)
     {
-        WriteFixedDutyProfile(new byte[] { 0x01, 0x01, 0x00 }, pumpDuty, 20, 100);
-        WriteFixedDutyProfile(new byte[] { 0x02, 0x01, 0x01 }, fanDuty, 0, 100);
+        WriteCommand(CreateFixedDutyProfile(0x01, pumpDuty));
+        WriteCommand(CreateFixedDutyProfile(0x02, fanDuty));
     }
 
     public void ConfigureLcd(int brightness, int rotationDegrees)
@@ -125,6 +137,8 @@ internal sealed class KrakenNativeDevice : IDisposable
 
     private void SendStaticImage(byte[] data)
     {
+        // Cooling only needs HID; discover/open the LCD interface only for an upload.
+        var bulkPipe = EnsureBulkPipe();
         DrainReports();
         WriteCommand(0x36, 0x01, 0x00, 0x01, 0x08);
         var response = ReadUntilPrefix(0x37, 0x01, 50);
@@ -138,7 +152,6 @@ internal sealed class KrakenNativeDevice : IDisposable
             .Concat(BitConverter.GetBytes(data.Length))
             .ToArray();
 
-        var bulkPipe = EnsureBulkPipe();
         bulkPipe.Write(header);
         bulkPipe.Write(data);
         Thread.Sleep(50);
@@ -150,17 +163,21 @@ internal sealed class KrakenNativeDevice : IDisposable
         }
     }
 
-    private void WriteFixedDutyProfile(byte[] channelId, int duty, int minDuty, int maxDuty)
+    internal static byte[] CreateFixedDutyProfile(byte channel, int duty)
     {
-        duty = Math.Clamp(duty, minDuty, maxDuty);
-        var payload = new byte[1 + channelId.Length + 39];
+        if (channel is not (0x01 or 0x02))
+            throw new ArgumentOutOfRangeException(nameof(channel));
+
+        duty = Math.Clamp(duty, channel == 0x01 ? 20 : 0, 100);
+        // The device stores 40 points for coolant temperatures 20-59 C.
+        var payload = new byte[4 + 40];
         payload[0] = 0x72;
-        channelId.CopyTo(payload, 1);
-        for (var i = 4; i < payload.Length; i++)
-        {
-            payload[i] = (byte)duty;
-        }
-        WriteCommand(payload);
+        payload[1] = channel;
+        payload[2] = 0x01;
+        payload[3] = channel == 0x02 ? (byte)0x01 : (byte)0x00;
+        Array.Fill(payload, (byte)duty, 4, 39);
+        payload[^1] = 100; // Critical-temperature endpoint must never reduce cooling.
+        return payload;
     }
 
     private byte[] PrepareStaticImagePayload(string imagePath, int orientationQuarterTurns)
@@ -204,16 +221,41 @@ internal sealed class KrakenNativeDevice : IDisposable
 
     private byte[] ReadUntilPrefix(byte first, byte second, int maxAttempts = 12)
     {
+        var originalTimeout = _hidStream.ReadTimeout;
+        try
+        {
+            return ReadMatchingReport(timeout =>
+            {
+                _hidStream.ReadTimeout = timeout;
+                return ReadReport();
+            }, first, second, maxAttempts, 2000);
+        }
+        finally
+        {
+            _hidStream.ReadTimeout = originalTimeout;
+        }
+    }
+
+    internal static byte[] ReadMatchingReport(Func<int, byte[]> readReport, byte first, byte second,
+        int maxAttempts, int timeoutMilliseconds)
+    {
+        var elapsed = Stopwatch.StartNew();
         for (var attempt = 0; attempt < maxAttempts; attempt++)
         {
-            var msg = ReadReport();
+            var remaining = timeoutMilliseconds - (int)elapsed.ElapsedMilliseconds;
+            if (remaining <= 0)
+            {
+                break;
+            }
+
+            var msg = readReport(remaining);
             if (msg.Length >= 2 && msg[0] == first && msg[1] == second)
             {
                 return msg;
             }
         }
 
-        throw new InvalidOperationException($"Timed out waiting for Kraken report {first:X2} {second:X2}.");
+        throw new TimeoutException($"Timed out waiting for Kraken report {first:X2} {second:X2}.");
     }
 
     private byte[] ReadReport()
@@ -240,29 +282,34 @@ internal sealed class KrakenNativeDevice : IDisposable
         {
             _hidStream.ReadTimeout = 1;
             var buffer = new byte[_hidReadLength];
-            while (true)
-            {
-                try
-                {
-                    var bytesRead = _hidStream.Read(buffer, 0, buffer.Length);
-                    if (bytesRead <= 0)
-                    {
-                        break;
-                    }
-                }
-                catch (TimeoutException)
-                {
-                    break;
-                }
-                catch (IOException)
-                {
-                    break;
-                }
-            }
+            DrainReports(() => _hidStream.Read(buffer, 0, buffer.Length));
         }
         finally
         {
             _hidStream.ReadTimeout = originalTimeout;
+        }
+    }
+
+    internal static void DrainReports(Func<int> readReport, int maxReports = 64, int timeoutMilliseconds = 50)
+    {
+        var elapsed = Stopwatch.StartNew();
+        for (var count = 0; count < maxReports && elapsed.ElapsedMilliseconds < timeoutMilliseconds; count++)
+        {
+            try
+            {
+                if (readReport() <= 0)
+                {
+                    break;
+                }
+            }
+            catch (TimeoutException)
+            {
+                break;
+            }
+            catch (IOException)
+            {
+                break;
+            }
         }
     }
 
@@ -303,7 +350,10 @@ internal sealed class KrakenNativeDevice : IDisposable
 
     private WinUsbBulkPipe EnsureBulkPipe()
     {
-        _bulkPipe ??= new WinUsbBulkPipe(_bulkDevicePath, BulkEndpoint);
+        _bulkPipe ??= new WinUsbBulkPipe(
+            FindBulkInterfacePath(ProductIdKrakenElite)
+                ?? throw new InvalidOperationException("NZXT Kraken Elite WinUSB interface was not found."),
+            BulkEndpoint);
         return _bulkPipe;
     }
 
@@ -329,23 +379,43 @@ internal static class Q565Encoder
 
     public static byte[] Encode(Bitmap bitmap)
     {
+        if (bitmap.PixelFormat != PixelFormat.Format24bppRgb)
+        {
+            throw new ArgumentException("Q565 encoding requires a 24-bit RGB bitmap.", nameof(bitmap));
+        }
+
         var width = bitmap.Width;
         var height = bitmap.Height;
-        var writer = new ByteListWriter(6 + (width * height * 3) + 1);
+        if (width > ushort.MaxValue || height > ushort.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(nameof(bitmap), "Q565 dimensions must fit in 16 bits.");
+        }
+        var writer = new ByteListWriter(checked(8 + (width * height * 3) + 1));
 
         Write32(writer, Q565Magic);
         Write16(writer, (ushort)width);
         Write16(writer, (ushort)height);
 
-        for (var y = 0; y < height; y++)
+        var pixels = bitmap.LockBits(new Rectangle(0, 0, width, height), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+        try
         {
-            for (var x = 0; x < width; x++)
+            var row = new byte[checked(width * 3)];
+            for (var y = 0; y < height; y++)
             {
-                var current = ToRgb565(bitmap.GetPixel(x, y));
-                writer.Write(Q565OpRgb565);
-                writer.Write((byte)(current & 0xFF));
-                writer.Write((byte)(current >> 8));
+                // Scan0 is the first logical row; signed stride also handles bottom-up storage.
+                Marshal.Copy(IntPtr.Add(pixels.Scan0, checked(y * pixels.Stride)), row, 0, row.Length);
+                for (var x = 0; x < row.Length; x += 3)
+                {
+                    var current = ToRgb565(row[x + 2], row[x + 1], row[x]);
+                    writer.Write(Q565OpRgb565);
+                    writer.Write((byte)(current & 0xFF));
+                    writer.Write((byte)(current >> 8));
+                }
             }
+        }
+        finally
+        {
+            bitmap.UnlockBits(pixels);
         }
 
         writer.Write(Q565OpEnd);
@@ -366,11 +436,11 @@ internal static class Q565Encoder
         writer.Write((byte)((value >> 8) & 0xFF));
     }
 
-    private static ushort ToRgb565(Color color)
+    private static ushort ToRgb565(byte red, byte green, byte blue)
     {
-        var r = (color.R * 249 + 1014) >> 11;
-        var g = (color.G * 253 + 505) >> 10;
-        var b = (color.B * 249 + 1014) >> 11;
+        var r = (red * 249 + 1014) >> 11;
+        var g = (green * 253 + 505) >> 10;
+        var b = (blue * 249 + 1014) >> 11;
         return (ushort)((r << 11) | (g << 5) | b);
     }
 
@@ -408,14 +478,29 @@ internal sealed class WinUsbBulkPipe : IDisposable
             NativeMethods.FileAttributeNormal | NativeMethods.FileFlagOverlapped,
             IntPtr.Zero);
 
-        if (_deviceHandle.IsInvalid)
+        try
         {
-            throw new InvalidOperationException($"Failed to open Kraken WinUSB device: {devicePath}");
-        }
+            if (_deviceHandle.IsInvalid)
+            {
+                throw new InvalidOperationException($"Failed to open Kraken WinUSB device. Win32={Marshal.GetLastWin32Error()} Path={devicePath}");
+            }
 
-        if (!NativeMethods.WinUsb_Initialize(_deviceHandle, out _winUsbHandle))
+            if (!NativeMethods.WinUsb_Initialize(_deviceHandle, out _winUsbHandle))
+            {
+                throw new InvalidOperationException($"Failed to initialize WinUSB for Kraken LCD. Win32={Marshal.GetLastWin32Error()} Path={devicePath}");
+            }
+
+            uint timeoutMilliseconds = 2000;
+            if (!NativeMethods.WinUsb_SetPipePolicy(_winUsbHandle, _pipeId,
+                    NativeMethods.PipeTransferTimeout, sizeof(uint), ref timeoutMilliseconds))
+            {
+                throw new InvalidOperationException($"Failed to set Kraken LCD transfer timeout. Win32={Marshal.GetLastWin32Error()}");
+            }
+        }
+        catch
         {
-            throw new InvalidOperationException($"Failed to initialize WinUSB for Kraken LCD. Win32={Marshal.GetLastWin32Error()} Path={devicePath}");
+            Dispose();
+            throw;
         }
     }
 
@@ -423,7 +508,7 @@ internal sealed class WinUsbBulkPipe : IDisposable
     {
         if (!NativeMethods.WinUsb_WritePipe(_winUsbHandle, _pipeId, buffer, buffer.Length, out var transferred, IntPtr.Zero))
         {
-            throw new InvalidOperationException("WinUSB bulk write to Kraken LCD failed.");
+            throw new InvalidOperationException($"WinUSB bulk write to Kraken LCD failed. Win32={Marshal.GetLastWin32Error()}");
         }
 
         if (transferred != buffer.Length)
@@ -452,6 +537,7 @@ internal sealed class WinUsbBulkPipe : IDisposable
         public const uint OpenExisting = 3;
         public const uint FileAttributeNormal = 0x00000080;
         public const uint FileFlagOverlapped = 0x40000000;
+        public const uint PipeTransferTimeout = 0x03;
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern SafeFileHandle CreateFile(
@@ -470,6 +556,15 @@ internal sealed class WinUsbBulkPipe : IDisposable
         [DllImport("winusb.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool WinUsb_Free(IntPtr interfaceHandle);
+
+        [DllImport("winusb.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool WinUsb_SetPipePolicy(
+            IntPtr interfaceHandle,
+            byte pipeId,
+            uint policyType,
+            uint valueLength,
+            ref uint value);
 
         [DllImport("winusb.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
